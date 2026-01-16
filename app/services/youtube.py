@@ -9,7 +9,12 @@ from youtube_transcript_api import (
     VideoUnavailable,
     YouTubeTranscriptApi,
 )
-from youtube_transcript_api._errors import NoTranscriptAvailable
+
+# Backwards compatibility - NoTranscriptAvailable was removed in newer versions
+try:
+    from youtube_transcript_api._errors import NoTranscriptAvailable
+except ImportError:
+    NoTranscriptAvailable = NoTranscriptFound
 
 from app.core.exceptions import (
     CaptionsDisabledError,
@@ -105,96 +110,53 @@ class YouTubeService:
         warnings: list[str] = []
 
         try:
-            # List available transcripts
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            # Use simple get_transcript method - more reliable
+            languages_to_try = []
+            if language:
+                languages_to_try.append(language)
+            languages_to_try.extend(["en", "en-US", "en-GB"])
 
-            # Get available languages for error messages
-            available_languages = []
-            try:
-                for transcript in transcript_list:
-                    available_languages.append(transcript.language_code)
-            except Exception:
-                pass
-
-            transcript = None
+            transcript_data = None
             detected_language = language or "en"
 
-            # Strategy 1: Try to get manually created transcript in preferred language
-            if language:
-                try:
-                    transcript = transcript_list.find_manually_created_transcript([language])
-                    detected_language = language
-                    logger.info("Found manual transcript", language=language, video_id=video_id)
-                except NoTranscriptFound:
-                    pass
+            # Try to get transcript directly
+            try:
+                transcript_data = YouTubeTranscriptApi.get_transcript(
+                    video_id,
+                    languages=languages_to_try if language else None,
+                )
+                logger.info("Fetched transcript directly", video_id=video_id)
+            except Exception as direct_error:
+                logger.debug("Direct fetch failed, trying list method", error=str(direct_error))
 
-            # Strategy 2: Try to get auto-generated transcript in preferred language
-            if transcript is None and language:
+                # Fallback to list_transcripts method
                 try:
-                    transcript = transcript_list.find_generated_transcript([language])
-                    detected_language = language
-                    warnings.append(f"Using auto-generated captions for {language}")
-                    logger.info("Found auto-generated transcript", language=language, video_id=video_id)
-                except NoTranscriptFound:
-                    pass
+                    transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
 
-            # Strategy 3: Try to get any manually created transcript
-            if transcript is None:
-                try:
-                    transcript = transcript_list.find_manually_created_transcript(
-                        ["en", "en-US", "en-GB"]
-                    )
-                    detected_language = transcript.language_code
-                    logger.info("Found English manual transcript", video_id=video_id)
-                except NoTranscriptFound:
-                    pass
-
-            # Strategy 4: Get any available transcript
-            if transcript is None:
-                try:
-                    # Get first available transcript
+                    transcript = None
+                    # Try to find any available transcript
                     for t in transcript_list:
                         transcript = t
                         detected_language = t.language_code
                         if t.is_generated:
                             warnings.append(f"Using auto-generated captions ({t.language_code})")
                         break
-                except StopIteration:
-                    pass
 
-            if transcript is None:
-                raise TranscriptNotFoundError(video_id, available_languages)
+                    if transcript:
+                        transcript_data = transcript.fetch()
+                except Exception as list_error:
+                    logger.error("List transcripts failed", error=str(list_error))
+                    raise
 
-            # Handle translation if requested
-            if translate_to and translate_to != detected_language:
-                try:
-                    transcript = transcript.translate(translate_to)
-                    warnings.append(f"Translated from {detected_language} to {translate_to}")
-                    detected_language = translate_to
-                    logger.info(
-                        "Translated transcript",
-                        from_lang=detected_language,
-                        to_lang=translate_to,
-                        video_id=video_id,
-                    )
-                except Exception as e:
-                    warnings.append(f"Translation to {translate_to} not available: {str(e)}")
-                    logger.warning(
-                        "Translation failed",
-                        to_lang=translate_to,
-                        error=str(e),
-                        video_id=video_id,
-                    )
-
-            # Fetch the transcript data
-            transcript_data = transcript.fetch()
+            if not transcript_data:
+                raise TranscriptNotFoundError(video_id)
 
             # Convert to segments
             segments = []
             for item in transcript_data:
                 segment = TranscriptionSegment(
                     start=item["start"],
-                    end=item["start"] + item["duration"],
+                    end=item["start"] + item.get("duration", 0),
                     text=item["text"],
                 )
                 segments.append(segment)

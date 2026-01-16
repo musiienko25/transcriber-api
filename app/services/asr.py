@@ -1,4 +1,4 @@
-"""ASR (Automatic Speech Recognition) service using Faster-Whisper."""
+"""ASR (Automatic Speech Recognition) service using OpenAI Whisper."""
 
 import asyncio
 from pathlib import Path
@@ -17,7 +17,7 @@ _model_lock = asyncio.Lock()
 
 
 class ASRService:
-    """Service for speech recognition using Faster-Whisper."""
+    """Service for speech recognition using OpenAI Whisper (local)."""
 
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -42,7 +42,7 @@ class ASRService:
             )
 
             try:
-                from faster_whisper import WhisperModel
+                import whisper
 
                 # Determine device
                 device = self.settings.whisper_device
@@ -53,27 +53,17 @@ class ASRService:
                     except ImportError:
                         device = "cpu"
 
-                # Determine compute type
-                compute_type = self.settings.whisper_compute_type
-                if compute_type == "auto":
-                    compute_type = "float16" if device == "cuda" else "int8"
-
                 # Load model in thread pool
                 loop = asyncio.get_event_loop()
                 _whisper_model = await loop.run_in_executor(
                     None,
-                    lambda: WhisperModel(
-                        self.settings.whisper_model,
-                        device=device,
-                        compute_type=compute_type,
-                    ),
+                    lambda: whisper.load_model(self.settings.whisper_model, device=device),
                 )
 
                 logger.info(
                     "Whisper model loaded",
                     model=self.settings.whisper_model,
                     device=device,
-                    compute_type=compute_type,
                 )
 
                 return _whisper_model
@@ -125,38 +115,33 @@ class ASRService:
             task = "transcribe"
             if translate_to == "en" and language != "en":
                 task = "translate"
-                warnings.append(f"Translating to English using Whisper's built-in translation")
+                warnings.append("Translating to English using Whisper's built-in translation")
 
-            def do_transcribe() -> tuple:
-                segments_gen, info = model.transcribe(
+            def do_transcribe() -> dict:
+                result = model.transcribe(
                     str(audio_path),
                     language=language,
                     task=task,
-                    beam_size=5,
-                    word_timestamps=False,
-                    vad_filter=True,  # Voice activity detection
-                    vad_parameters=dict(
-                        min_silence_duration_ms=500,
-                    ),
+                    verbose=False,
                 )
-                # Convert generator to list
-                return list(segments_gen), info
+                return result
 
-            raw_segments, info = await loop.run_in_executor(None, do_transcribe)
+            result = await loop.run_in_executor(None, do_transcribe)
 
             # Extract info
-            detected_language = info.language
-            duration = info.duration
-            confidence = info.language_probability
+            detected_language = result.get("language", language or "en")
+            
+            # Calculate duration from segments
+            raw_segments = result.get("segments", [])
+            duration = raw_segments[-1]["end"] if raw_segments else 0.0
 
             # Convert to our segment format
             segments = []
             for seg in raw_segments:
                 segment = TranscriptionSegment(
-                    start=seg.start,
-                    end=seg.end,
-                    text=seg.text.strip(),
-                    confidence=seg.avg_logprob if hasattr(seg, "avg_logprob") else None,
+                    start=seg["start"],
+                    end=seg["end"],
+                    text=seg["text"].strip(),
                 )
                 segments.append(segment)
 
@@ -166,10 +151,9 @@ class ASRService:
                 language=detected_language,
                 duration=duration,
                 segments_count=len(segments),
-                confidence=confidence,
             )
 
-            return segments, detected_language, confidence, duration, warnings
+            return segments, detected_language, 0.9, duration, warnings
 
         except ModelNotAvailableError:
             raise
